@@ -18,6 +18,7 @@ import cloudscraper
 import colorama
 from requests.adapters import ReadTimeout, ConnectionError
 from termcolor import colored
+from urllib import parse
 from urllib3.exceptions import NewConnectionError
 
 from woob.browser.exceptions import ClientError, ServerError, HTTPNotFound
@@ -42,22 +43,6 @@ try:
 except ImportError:
     def playsound(*args):
         pass
-
-
-def log(text, *args, **kwargs):
-    args = (colored(arg, 'yellow') for arg in args)
-    if 'color' in kwargs:
-        text = colored(text, kwargs.pop('color'))
-    text = text % tuple(args)
-    print(text, **kwargs)
-
-
-def log_ts(text=None, *args, **kwargs):
-    ''' Log with timestamp'''
-    now = datetime.datetime.now()
-    print("[%s]" % now.isoformat(" ", "seconds"))
-    if text:
-        log(text, *args, **kwargs)
 
 
 class Session(cloudscraper.CloudScraper):
@@ -94,6 +79,34 @@ class CentersPage(HTMLPage):
             data = json.loads(div.attrib['data-props'])
             yield data['searchResultId']
 
+    def get_next_page(self):
+        # French doctolib uses data-u attribute of span-element to create the link when user hovers span
+        for span in self.doc.xpath('//div[contains(@class, "next")]/span'):
+            if not span.attrib.has_key('data-u'):
+                continue
+
+            # How to find the corresponding javascript-code:
+            # Press F12 to open dev-tools, select elements-tab, find div.next, right click on element and enable break on substructure change
+            # Hover "Next" element and follow callstack upwards
+            # JavaScript:
+            # var t = (e = r()(e)).data("u")
+            #     , n = atob(t.replace(/\s/g, '').split('').reverse().join(''));
+            
+            import base64
+            href = base64.urlsafe_b64decode(''.join(span.attrib['data-u'].split())[::-1]).decode()
+            query = dict(parse.parse_qsl(parse.urlsplit(href).query))
+
+            if 'page' in query:
+                return int(query['page'])
+
+        for a in self.doc.xpath('//div[contains(@class, "next")]/a'):
+            href = a.attrib['href']
+            query = dict(parse.parse_qsl(parse.urlsplit(href).query))
+
+            if 'page' in query:
+                return int(query['page'])
+        
+        return None
 
 class CenterResultPage(JsonPage):
     pass
@@ -109,11 +122,11 @@ class CenterBookingPage(JsonPage):
             # ignore case as some doctors use their own spelling
             if re.search(regex, s['name'], re.IGNORECASE):
                 if s['allow_new_patients'] == False:
-                    log('Motive %s not allowed for new patients at this center. Skipping vaccine...',
+                    logger.log('Motive %s not allowed for new patients at this center. Skipping vaccine...',
                         s['name'], flush=True)
                     continue
                 if not singleShot and not s['first_shot_motive']:
-                    log('Skipping second shot motive %s...',
+                    logger.log('Skipping second shot motive %s...',
                         s['name'], flush=True)
                     continue
                 return s['id']
@@ -232,9 +245,9 @@ class Doctolib(LoginBrowser):
             if e.response.status_code in [503] \
                 and 'text/html' in e.response.headers['Content-Type'] \
                     and ('cloudflare' in e.response.text or 'Checking your browser before accessing' in e .response.text):
-                log('Request blocked by CloudFlare', color='red')
+                logger.log('Request blocked by CloudFlare', color='red')
             if e.response.status_code in [520]:
-                log('Cloudflare is unable to connect to Doctolib server. Please retry later.', color='red')
+                logger.log('Cloudflare is unable to connect to Doctolib server. Please retry later.', color='red')
             raise
         try:
             self.login.go(json={'kind': 'patient',
@@ -250,7 +263,7 @@ class Doctolib(LoginBrowser):
             print("Requesting 2fa code...")
             if not code:
                 if not sys.__stdin__.isatty():
-                    log("Auth Code input required, but no interactive terminal available. Please provide it via command line argument '--code'.", color='red')
+                    logger.log("Auth Code input required, but no interactive terminal available. Please provide it via command line argument '--code'.", color='red')
                     return False
                 self.send_auth_code.go(
                     json={'two_factor_auth_method': 'email'}, method="POST")
@@ -264,26 +277,28 @@ class Doctolib(LoginBrowser):
 
         return True
 
-    def find_centers(self, where, motives=None):
+    def find_centers(self, where, motives=None, page=1):
         if motives is None:
             motives = self.vaccine_motives.keys()
         for city in where:
             try:
                 self.centers.go(where=city, params={
-                                'ref_visit_motive_ids[]': motives})
+                                'ref_visit_motive_ids[]': motives, 'page': page})
             except ServerError as e:
                 if e.response.status_code in [503]:
                     if 'text/html' in e.response.headers['Content-Type'] \
                         and ('cloudflare' in e.response.text or
                              'Checking your browser before accessing' in e .response.text):
-                        log('Request blocked by CloudFlare', color='red')
+                        logger.log('Request blocked by CloudFlare', color='red')
                     return
                 if e.response.status_code in [520]:
-                    log('Cloudflare is unable to connect to Doctolib server. Please retry later.', color='red')
+                    logger.log('Cloudflare is unable to connect to Doctolib server. Please retry later.', color='red')
                     return
                 raise
             except HTTPNotFound as e:
                 raise CityNotFound(city) from e
+
+            next_page = self.page.get_next_page()
 
             for i in self.page.iter_centers_ids():
                 page = self.center_result.open(
@@ -299,6 +314,10 @@ class Doctolib(LoginBrowser):
                     yield page.doc['search_result']
                 except KeyError:
                     pass
+
+            if next_page:
+                for center in self.find_centers(where, motives, next_page):
+                    yield center
 
     def get_patients(self):
         self.master_patient.go()
@@ -329,16 +348,16 @@ class Doctolib(LoginBrowser):
         motives_id = dict((k, v)
                           for k, v in motives_id.items() if v is not None)
         if len(motives_id.values()) == 0:
-            log('Unable to find requested vaccines in motives')
-            log('Motives: %s', ', '.join(self.page.get_motives()))
+            logger.log('Unable to find requested vaccines in motives')
+            logger.log('Motives: %s', ', '.join(self.page.get_motives()))
             return False
 
         for place in self.page.get_places():
             if place['name']:
-                log('– %s...', place['name'])
+                logger.log('– %s...', place['name'])
             practice_id = place['practice_ids'][0]
             for vac_name, motive_id in motives_id.items():
-                log('  Vaccine %s...', vac_name, end=' ', flush=True)
+                logger.log('  Vaccine %s...', vac_name, end=' ', flush=True)
                 agenda_ids = center_page.get_agenda_ids(motive_id, practice_id)
                 if len(agenda_ids) == 0:
                     # do not filter to give a chance
@@ -366,15 +385,15 @@ class Doctolib(LoginBrowser):
                 date = None
 
         if len(self.page.doc['availabilities']) == 0:
-            log('no availabilities', color='red')
+            logger.log('no availabilities', color='red')
             return False
 
         slot = self.page.find_best_slot(start_date, end_date)
         if not slot:
             if only_second == False and only_third == False:
-                log('First slot not found :(', color='red')
+                logger.log('First slot not found :(', color='red')
             else:
-                log('Slot not found :(', color='red')
+                logger.log('Slot not found :(', color='red')
             return False
 
         # depending on the country, the slot is returned in a different format. Go figure...
@@ -384,7 +403,7 @@ class Doctolib(LoginBrowser):
                 slot_date_second = slot['steps'][1]['start_date']
         elif isinstance(slot, str):
             if vac_name != "janssen" and not only_second and not only_third:
-                log('Only one slot for multi-shot vaccination found')
+                logger.log('Only one slot for multi-shot vaccination found')
             # should be for Janssen, second or third shots only, otherwise it is a list
             slot_date_first = slot
         elif isinstance(slot, list):
@@ -392,12 +411,12 @@ class Doctolib(LoginBrowser):
             if vac_name != "janssen":  # maybe redundant?
                 slot_date_second = slot[1]
         else:
-            log('Error while fetching first slot.', color='red')
+            logger.log('Error while fetching first slot.', color='red')
             return False
         if vac_name != "janssen" and not only_second and not only_third:
             assert slot_date_second
-        log('found!', color='green')
-        log('  ├╴ Best slot found: %s', parse_date(
+        logger.log('found!', color='green')
+        logger.log('  ├╴ Best slot found: %s', parse_date(
             slot_date_first).strftime('%c'))
 
         appointment = {'profile_id':    profile_id,
@@ -416,7 +435,7 @@ class Doctolib(LoginBrowser):
         self.appointment.go(data=json.dumps(data), headers=headers)
 
         if self.page.is_error():
-            log('  └╴ Appointment not available anymore :( %s', self.page.get_error())
+            logger.log('  └╴ Appointment not available anymore :( %s', self.page.get_error())
             return False
 
         playsound('ding.mp3')
@@ -433,7 +452,7 @@ class Doctolib(LoginBrowser):
 
             second_slot = self.page.find_best_slot()
             if not second_slot:
-                log('  └╴ No second shot found')
+                logger.log('  └╴ No second shot found')
                 return False
 
             # in theory we could use the stored slot_date_second result from above,
@@ -446,17 +465,17 @@ class Doctolib(LoginBrowser):
             # elif isinstance(slot, list):
             #    slot_date_second = second_slot[1]
             else:
-                log('Error while fetching second slot.', color='red')
+                logger.log('Error while fetching second slot.', color='red')
                 return False
 
-            log('  ├╴ Second shot: %s', parse_date(
+            logger.log('  ├╴ Second shot: %s', parse_date(
                 slot_date_second).strftime('%c'))
 
             data['second_slot'] = slot_date_second
             self.appointment.go(data=json.dumps(data), headers=headers)
 
             if self.page.is_error():
-                log('  └╴ Appointment not available anymore :( %s',
+                logger.log('  └╴ Appointment not available anymore :( %s',
                     self.page.get_error())
                 return False
 
@@ -464,7 +483,7 @@ class Doctolib(LoginBrowser):
 
         self.appointment_edit.go(id=a_id)
 
-        log('  ├╴ Booking for %(first_name)s %(last_name)s...' % self.patient)
+        logger.log('  ├╴ Booking for %(first_name)s %(last_name)s...' % self.patient)
 
         self.appointment_edit.go(
             id=a_id, params={'master_patient_id': self.patient['id']})
@@ -483,7 +502,7 @@ class Doctolib(LoginBrowser):
             custom_fields[field['id']] = value
 
         if dry_run:
-            log('  └╴ Booking status: %s', 'fake')
+            logger.log('  └╴ Booking status: %s', 'fake')
             return True
 
         data = {'appointment': {'custom_fields_values': custom_fields,
@@ -503,12 +522,12 @@ class Doctolib(LoginBrowser):
             data), headers=headers, method='PUT')
 
         if 'redirection' in self.page.doc and not 'confirmed-appointment' in self.page.doc['redirection']:
-            log('  ├╴ Open %s to complete', self.BASEURL +
+            logger.log('  ├╴ Open %s to complete', self.BASEURL +
                 self.page.doc['redirection'])
 
         self.appointment_post.go(id=a_id)
 
-        log('  └╴ Booking status: %s', self.page.doc['confirmed'])
+        logger.log('  └╴ Booking status: %s', self.page.doc['confirmed'])
 
         return self.page.doc['confirmed']
 
@@ -566,8 +585,16 @@ class DoctolibFR(Doctolib):
     center = URL(r'/centre-de-sante/.*', CenterPage)
 
 
-class Application:
-    @classmethod
+class SingletonMeta(type):
+    _instances = {}
+
+    def __call__(cls, *args, **kwargs):
+        if cls not in cls._instances:
+            instance = super().__call__(*args, **kwargs)
+            cls._instances[cls] = instance
+        return cls._instances[cls]
+
+class Logger(metaclass = SingletonMeta):
     def create_default_logger(cls):
         # stderr logger
         format = '%(asctime)s:%(levelname)s:%(name)s:' \
@@ -580,10 +607,34 @@ class Application:
         logging.root.handlers = []
 
         logging.root.setLevel(level)
-        logging.root.addHandler(self.create_default_logger())
+        logging.root.addHandler(self.create_default_logger())   
+
+    def log(self, text, *args, **kwargs):
+        args = (colored(arg, 'yellow') for arg in args)
+        if 'color' in kwargs:
+            text = colored(text, kwargs.pop('color'))
+        text = text % tuple(args)
+        print(text, **kwargs)
+
+
+    def log_ts(self, text=None, *args, **kwargs):
+        ''' log with timestamp'''
+        now = datetime.datetime.now()
+        print("[%s]" % now.isoformat(" ", "seconds"))
+        if text:
+            self.log(text, *args, **kwargs)
+
+logger = Logger()
+
+
+class Application(metaclass = SingletonMeta):
+    # @classmethod
+
 
     def main(self, cli_args=None):
         colorama.init()  # needed for windows
+
+
 
         doctolib_map = {
             "fr": DoctolibFR,
@@ -638,10 +689,10 @@ class Application:
 
         if args.debug:
             responses_dirname = tempfile.mkdtemp(prefix='woob_session_')
-            self.setup_loggers(logging.DEBUG)
+            logger.setup_loggers(logging.DEBUG)
         else:
             responses_dirname = None
-            self.setup_loggers(logging.WARNING)
+            logger.setup_loggers(logging.WARNING)
 
         if not args.password:
             args.password = getpass.getpass()
@@ -746,15 +797,15 @@ class Application:
                 return 1
         else:
             end_date = start_date + relativedelta(days=args.time_window)
-        log('Starting to look for vaccine slots for %s %s between %s and %s...',
+        logger.log('Starting to look for vaccine slots for %s %s between %s and %s...',
             docto.patient['first_name'], docto.patient['last_name'], start_date, end_date)
-        log('Vaccines: %s', ', '.join(vaccine_list))
-        log('Country: %s ', args.country)
-        log('This may take a few minutes/hours, be patient!')
+        logger.log('Vaccines: %s', ', '.join(vaccine_list))
+        logger.log('Country: %s ', args.country)
+        logger.log('This may take a few minutes/hours, be patient!')
         cities = [docto.normalize(city) for city in args.city.split(',')]
 
         while True:
-            log_ts()
+            logger.log_ts()
             try:
                 for center in docto.find_centers(cities, motives):
                     if args.center:
@@ -791,20 +842,20 @@ class Application:
                             "Skipping city '%(city)s' %(name_with_title)s" % center)
                         continue
 
-                    log('')
+                    logger.log('')
 
-                    log('Center %(name_with_title)s (%(city)s):' % center)
+                    logger.log('Center %(name_with_title)s (%(city)s):' % center)
 
                     if docto.try_to_book(center, vaccine_list, start_date, end_date, args.only_second, args.only_third, args.dry_run):
-                        log('')
-                        log('💉 %s Congratulations.' %
+                        logger.log('')
+                        logger.log('💉 %s Congratulations.' %
                             colored('Booked!', 'green', attrs=('bold',)))
                         return 0
 
                     sleep(SLEEP_INTERVAL_AFTER_CENTER)
 
-                    log('')
-                log('No free slots found at selected centers. Trying another round in %s sec...', SLEEP_INTERVAL_AFTER_RUN)
+                    logger.log('')
+                logger.log('No free slots found at selected centers. Trying another round in %s sec...', SLEEP_INTERVAL_AFTER_RUN)
                 sleep(SLEEP_INTERVAL_AFTER_RUN)
             except CityNotFound as e:
                 print('\n%s: City %s not found. Make sure you selected a city from the available countries.' % (
