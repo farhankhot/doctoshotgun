@@ -18,6 +18,7 @@ import cloudscraper
 import colorama
 from requests.adapters import ReadTimeout, ConnectionError
 from termcolor import colored
+from urllib import parse
 from urllib3.exceptions import NewConnectionError
 
 from woob.browser.exceptions import ClientError, ServerError, HTTPNotFound
@@ -94,6 +95,34 @@ class CentersPage(HTMLPage):
             data = json.loads(div.attrib['data-props'])
             yield data['searchResultId']
 
+    def get_next_page(self):
+        # French doctolib uses data-u attribute of span-element to create the link when user hovers span
+        for span in self.doc.xpath('//div[contains(@class, "next")]/span'):
+            if not span.attrib.has_key('data-u'):
+                continue
+
+            # How to find the corresponding javascript-code:
+            # Press F12 to open dev-tools, select elements-tab, find div.next, right click on element and enable break on substructure change
+            # Hover "Next" element and follow callstack upwards
+            # JavaScript:
+            # var t = (e = r()(e)).data("u")
+            #     , n = atob(t.replace(/\s/g, '').split('').reverse().join(''));
+            
+            import base64
+            href = base64.urlsafe_b64decode(''.join(span.attrib['data-u'].split())[::-1]).decode()
+            query = dict(parse.parse_qsl(parse.urlsplit(href).query))
+
+            if 'page' in query:
+                return int(query['page'])
+
+        for a in self.doc.xpath('//div[contains(@class, "next")]/a'):
+            href = a.attrib['href']
+            query = dict(parse.parse_qsl(parse.urlsplit(href).query))
+
+            if 'page' in query:
+                return int(query['page'])
+        
+        return None
 
 class CenterResultPage(JsonPage):
     pass
@@ -264,13 +293,13 @@ class Doctolib(LoginBrowser):
 
         return True
 
-    def find_centers(self, where, motives=None):
+    def find_centers(self, where, motives=None, page=1):
         if motives is None:
             motives = self.vaccine_motives.keys()
         for city in where:
             try:
                 self.centers.go(where=city, params={
-                                'ref_visit_motive_ids[]': motives})
+                                'ref_visit_motive_ids[]': motives, 'page': page})
             except ServerError as e:
                 if e.response.status_code in [503]:
                     if 'text/html' in e.response.headers['Content-Type'] \
@@ -284,6 +313,8 @@ class Doctolib(LoginBrowser):
                 raise
             except HTTPNotFound as e:
                 raise CityNotFound(city) from e
+
+            next_page = self.page.get_next_page()
 
             for i in self.page.iter_centers_ids():
                 page = self.center_result.open(
@@ -299,6 +330,10 @@ class Doctolib(LoginBrowser):
                     yield page.doc['search_result']
                 except KeyError:
                     pass
+
+            if next_page:
+                for center in self.find_centers(where, motives, next_page):
+                    yield center
 
     def get_patients(self):
         self.master_patient.go()
@@ -566,7 +601,8 @@ class DoctolibFR(Doctolib):
     center = URL(r'/centre-de-sante/.*', CenterPage)
 
 
-class Application:
+class PrepareArgs:
+
     @classmethod
     def create_default_logger(cls):
         # stderr logger
@@ -581,14 +617,14 @@ class Application:
 
         logging.root.setLevel(level)
         logging.root.addHandler(self.create_default_logger())
-
-    def main(self, cli_args=None):
-        colorama.init()  # needed for windows
+    
+    def prepare_args(self, cli_args=None):
 
         doctolib_map = {
             "fr": DoctolibFR,
             "de": DoctolibDE
         }
+
 
         parser = argparse.ArgumentParser(
             description="Book a vaccine slot on Doctolib")
@@ -632,9 +668,12 @@ class Application:
         parser.add_argument('username', help='Doctolib username')
         parser.add_argument('password', nargs='?', help='Doctolib password')
         parser.add_argument('--code', type=str, default=None, help='2FA code')
+        
+        global args
         args = parser.parse_args(cli_args if cli_args else sys.argv[1:])
 
         from types import SimpleNamespace
+
 
         if args.debug:
             responses_dirname = tempfile.mkdtemp(prefix='woob_session_')
@@ -646,10 +685,16 @@ class Application:
         if not args.password:
             args.password = getpass.getpass()
 
+        global docto
         docto = doctolib_map[args.country](
             args.username, args.password, responses_dirname=responses_dirname)
         if not docto.do_login(args.code):
             return 1
+
+        
+class SelectPatient:
+
+    def select_patient(self):
 
         patients = docto.get_patients()
         if len(patients) == 0:
@@ -657,6 +702,7 @@ class Application:
             return 1
         if args.patient >= 0 and args.patient < len(patients):
             docto.patient = patients[args.patient]
+
         elif len(patients) > 1:
             print('Available patients are:')
             for i, patient in enumerate(patients):
@@ -666,7 +712,7 @@ class Application:
                 print('For which patient do you want to book a slot?',
                       end=' ', flush=True)
                 try:
-                    docto.patient = patients[int(sys.stdin.readline().strip())]
+                    self.docto.patient = patients[int(sys.stdin.readline().strip())]
                 except (ValueError, IndexError):
                     continue
                 else:
@@ -674,7 +720,13 @@ class Application:
         else:
             docto.patient = patients[0]
 
+class GetMotives:
+
+    def get_motives(self):
+
+        global motives
         motives = []
+
         if not args.pfizer and not args.moderna and not args.janssen and not args.astrazeneca:
             if args.only_second:
                 motives.append(docto.KEY_PFIZER_SECOND)
@@ -726,10 +778,20 @@ class Application:
             else:
                 motives.append(docto.KEY_ASTRAZENECA)
 
+        global vaccine_list 
         vaccine_list = [docto.vaccine_motives[motive] for motive in motives]
+
+    
+
+class ParseDate:
+
+    def parse_date(self):
+        global start_date
+        global end_date
 
         if args.start_date:
             try:
+                
                 start_date = datetime.datetime.strptime(
                     args.start_date, '%d/%m/%Y').date()
             except ValueError as e:
@@ -751,7 +813,12 @@ class Application:
         log('Vaccines: %s', ', '.join(vaccine_list))
         log('Country: %s ', args.country)
         log('This may take a few minutes/hours, be patient!')
+        global cities
         cities = [docto.normalize(city) for city in args.city.split(',')]
+
+
+class Book:
+    def book(self):
 
         while True:
             log_ts()
@@ -760,7 +827,7 @@ class Application:
                     if args.center:
                         if center['name_with_title'] not in args.center:
                             logging.debug("Skipping center '%s'" %
-                                          center['name_with_title'])
+                                            center['name_with_title'])
                             continue
                     if args.center_regex:
                         center_matched = False
@@ -820,11 +887,35 @@ class Application:
                 message = template.format(type(e).__name__, e.args)
                 print(message)
                 return 1
+
+class Facade:
+    def __init__(self):
+        self.args = PrepareArgs()
+        self.patient = SelectPatient()
+        self.motives = GetMotives()
+        self.date = ParseDate()
+        self.book = Book()
+
+    def BookVaccineAppointment(self):
+        self.args.prepare_args()
+        self.patient.select_patient()
+        self.motives.get_motives()
+        self.date.parse_date()            
+        self.book.book()
+
+
+class Application:
+    
+    def main(self, cli_args=None):
+        colorama.init()  # needed for windows
+
+        facade = Facade()
+        facade.BookVaccineAppointment()
+        
         return 0
 
-
 if __name__ == '__main__':
-    try:
+    try:    
         sys.exit(Application().main())
     except KeyboardInterrupt:
         print('Abort.')
